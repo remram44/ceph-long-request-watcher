@@ -6,6 +6,7 @@ use std::env::args_os;
 use std::ffi::OsString;
 use std::fs::{File, read_dir};
 use std::io::{BufReader, BufRead, Error as IoError, ErrorKind as IoErrorKind};
+use std::path::PathBuf;
 use std::process::exit;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
@@ -34,6 +35,7 @@ fn main() {
     // Parse command line
     let mut interval = 5.0;
     let mut metrics_addr: std::net::SocketAddr = ([0, 0, 0, 0], 8080).into();
+    let mut debugfs: PathBuf = "/sys/kernel/debug".into();
 
     let mut args = args_os();
     args.next();
@@ -43,7 +45,9 @@ Options:
     --interval SECONDS
         Check requests every SECONDS
     --metrics PORT
-        Expose the statistics on HTTP PORT (default: 8080)";
+        Expose the statistics on HTTP PORT (default: 8080)
+    --debugfs PATH
+        Location to debug filesystem (default: /sys/kernel/debug)";
     while let Some(arg) = args.next() {
         if &arg == "--help" {
             println!("{}", usage);
@@ -52,12 +56,25 @@ Options:
             interval = parse_option(args.next(), "--interval");
         } else if &arg == "--metrics" {
             metrics_addr = parse_option(args.next(), "--metrics");
+        } else if &arg == "--debugfs" {
+            match args.next() {
+                Some(s) => {
+                    debugfs.clear();
+                    debugfs.push(s);
+                }
+                None => {
+                    eprintln!("Missing argument");
+                    exit(2);
+                }
+            }
         } else {
             eprintln!("Too many arguments");
             eprintln!("{}", usage);
             exit(2);
         }
     }
+
+    debugfs.push("ceph");
 
     // Set up Prometheus
     let longest_opts = Opts::new("longest_request_seconds", "Duration of longest request");
@@ -98,7 +115,7 @@ Options:
         let mut longest: f64 = 0.0;
 
         // Loop on clients
-        let dir = match read_dir("/sys/kernel/debug/ceph") {
+        let dir = match read_dir(&debugfs) {
             Ok(d) => d,
             Err(e) => {
                 error!("Error reading debug filesystem: {}", e);

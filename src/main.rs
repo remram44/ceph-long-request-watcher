@@ -36,6 +36,7 @@ fn main() {
     let mut interval = 5.0;
     let mut metrics_addr: std::net::SocketAddr = ([0, 0, 0, 0], 8080).into();
     let mut debugfs: PathBuf = "/sys/kernel/debug".into();
+    let mut no_ceph_ok = false;
 
     let mut args = args_os();
     args.next();
@@ -47,7 +48,10 @@ Options:
     --metrics ADDR:PORT
         Expose the statistics on HTTP ADDR:PORT (default: 0.0.0.0:8080)
     --debugfs PATH
-        Location to debug filesystem (default: /sys/kernel/debug)";
+        Location to debug filesystem (default: /sys/kernel/debug)
+    --no-ceph-ok
+        Don't error out if debug/ceph doesn't exist at all
+        (e.g. module not loaded)";
     while let Some(arg) = args.next() {
         if &arg == "--help" {
             println!("{}", usage);
@@ -67,6 +71,8 @@ Options:
                     exit(2);
                 }
             }
+        } else if &arg == "--no-ceph-ok" {
+            no_ceph_ok = true;
         } else {
             eprintln!("Too many arguments");
             eprintln!("{}", usage);
@@ -118,8 +124,13 @@ Options:
         let dir = match read_dir(&debugfs) {
             Ok(d) => d,
             Err(e) => {
-                error!("Error reading debug filesystem: {}", e);
-                exit(1);
+                if e.kind() == IoErrorKind::NotFound && no_ceph_ok {
+                    std::thread::sleep(Duration::from_secs_f32(interval));
+                    continue;
+                } else {
+                    error!("Error reading debug filesystem: {}", e);
+                    exit(1);
+                }
             }
         };
         for client in dir {

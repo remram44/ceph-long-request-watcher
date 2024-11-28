@@ -44,8 +44,8 @@ Usage: ceph-long-request-watcher [options]
 Options:
     --interval SECONDS
         Check requests every SECONDS
-    --metrics PORT
-        Expose the statistics on HTTP PORT (default: 8080)
+    --metrics ADDR:PORT
+        Expose the statistics on HTTP ADDR:PORT (default: 0.0.0.0:8080)
     --debugfs PATH
         Location to debug filesystem (default: /sys/kernel/debug)";
     while let Some(arg) = args.next() {

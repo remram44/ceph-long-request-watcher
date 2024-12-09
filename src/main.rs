@@ -5,9 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::env::args_os;
 use std::ffi::OsString;
 use std::fs::{File, read_dir};
-use std::io::{BufReader, BufRead, Error as IoError, ErrorKind as IoErrorKind};
+use std::io::{BufReader, BufRead, Error as IoError, ErrorKind as IoErrorKind, Write};
 use std::path::PathBuf;
 use std::process::exit;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 
@@ -82,6 +83,8 @@ Options:
 
     debugfs.push("ceph");
 
+    let data: Arc<Mutex<(Instant, HashMap<u64, (u32, Instant)>)>> = Arc::new(Mutex::new((Instant::now(), HashMap::new())));
+
     // Set up Prometheus
     let longest_opts = Opts::new("longest_request_seconds", "Duration of longest request");
     let longest_metric = Gauge::with_opts(longest_opts).unwrap();
@@ -90,6 +93,7 @@ Options:
         .unwrap();
 
     // Start metrics server thread
+    let prom_data: Arc<_> = data.clone();
     {
         use prometheus::Encoder;
         use tokio::runtime::Builder;
@@ -109,77 +113,103 @@ Options:
                     Response::builder()
                         .header("Content-type", "text/plain")
                         .body(buffer)
-                });
+                })
+                .or(warp::path("requests").map(move || {
+                    let data: &Mutex<_> = &*prom_data;
+                    let data = data.lock().unwrap();
+                    let &(ref updated, ref requests) = &*data;
+
+                    let mut requests: Vec<_> = requests.values().collect();
+                    requests.sort_by(|&(target1, since1), &(target2, since2)| {
+                        since2.cmp(since1).then(target1.cmp(target2))
+                    });
+
+                    let mut buffer = Vec::new();
+                    for (target, since) in requests {
+                        writeln!(
+                            buffer, "osd.{:<5} {:>5.1} second",
+                            target,
+                            updated.duration_since(*since).as_secs_f64(),
+                        ).unwrap();
+                    }
+                    buffer
+                }))
+                ;
                 warp::serve(routes).run(metrics_addr).await;
             });
         });
     }
 
-    let mut requests: HashMap<u64, Instant> = HashMap::new();
+    let data: &Mutex<_> = &*data;
     let mut seen_tids: HashSet<u64> = HashSet::new();
 
     loop {
-        let now = Instant::now();
-        seen_tids.clear();
-        let mut longest: f64 = 0.0;
+        {
+            let mut data = data.lock().unwrap();
+            let &mut (ref mut now, ref mut requests) = &mut *data;
 
-        // Loop on clients
-        let dir = match read_dir(&debugfs) {
-            Ok(d) => d,
-            Err(e) => {
-                if e.kind() == IoErrorKind::NotFound && no_ceph_ok {
-                    std::thread::sleep(Duration::from_secs_f32(interval));
-                    continue;
-                } else {
-                    error!("Error reading debug filesystem: {}", e);
-                    exit(1);
-                }
-            }
-        };
-        for client in dir {
-            let mut client = match client {
-                Ok(c) => c.path(),
-                Err(e) => {
-                    error!("Error reading debug filesystem: {}", e);
-                    exit(1);
-                }
-            };
-            client.push("osdc");
-            let osdc = match File::open(client) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Error opening osdc on debug filesystem: {}", e);
-                    exit(1);
-                }
-            };
-            let osdc = BufReader::new(osdc);
-            let osdc = match parse_osdc(osdc) {
-                Ok(o) => o,
-                Err(e) => {
-                    error!("Error parsing osdc on debug filesystem: {}", e);
-                    exit(1);
-                }
-            };
+            *now = Instant::now();
+            seen_tids.clear();
+            let mut longest: f64 = 0.0;
 
-            for request in &osdc.requests {
-                match requests.entry(request.tid) {
-                    std::collections::hash_map::Entry::Occupied(value) => {
-                        let first_seen = *value.get();
-                        longest = longest.max(now.duration_since(first_seen).as_secs_f64());
-                    }
-                    std::collections::hash_map::Entry::Vacant(value) => {
-                        value.insert(now);
+            // Loop on clients
+            let dir = match read_dir(&debugfs) {
+                Ok(d) => d,
+                Err(e) => {
+                    if e.kind() == IoErrorKind::NotFound && no_ceph_ok {
+                        std::thread::sleep(Duration::from_secs_f32(interval));
+                        continue;
+                    } else {
+                        error!("Error reading debug filesystem: {}", e);
+                        exit(1);
                     }
                 }
-                seen_tids.insert(request.tid);
+            };
+            for client in dir {
+                let mut client = match client {
+                    Ok(c) => c.path(),
+                    Err(e) => {
+                        error!("Error reading debug filesystem: {}", e);
+                        exit(1);
+                    }
+                };
+                client.push("osdc");
+                let osdc = match File::open(client) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Error opening osdc on debug filesystem: {}", e);
+                        exit(1);
+                    }
+                };
+                let osdc = BufReader::new(osdc);
+                let osdc = match parse_osdc(osdc) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!("Error parsing osdc on debug filesystem: {}", e);
+                        exit(1);
+                    }
+                };
+
+                for request in &osdc.requests {
+                    match requests.entry(request.tid) {
+                        std::collections::hash_map::Entry::Occupied(value) => {
+                            let (_, first_seen) = *value.get();
+                            longest = longest.max(now.duration_since(first_seen).as_secs_f64());
+                        }
+                        std::collections::hash_map::Entry::Vacant(value) => {
+                            value.insert((request.target, *now));
+                        }
+                    }
+                    seen_tids.insert(request.tid);
+                }
             }
+
+            // Forget unseen requests
+            requests.retain(|k, _| seen_tids.contains(k));
+
+            // Set metric
+            longest_metric.set(longest);
         }
-
-        // Forget unseen requests
-        requests.retain(|k, _| seen_tids.contains(k));
-
-        // Set metric
-        longest_metric.set(longest);
 
         // Wait before next measurement
         std::thread::sleep(Duration::from_secs_f32(interval));

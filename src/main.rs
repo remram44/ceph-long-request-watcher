@@ -29,6 +29,22 @@ fn parse_option<R: std::str::FromStr>(opt: Option<OsString>, flag: &'static str)
     exit(2);
 }
 
+trait OrExitExt<T> {
+    fn or_exit(self, message: &str) -> T;
+}
+
+impl<T, E: std::fmt::Display> OrExitExt<T> for Result<T, E> {
+    fn or_exit(self, message: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(e) => {
+                error!("{}: {}", message, e);
+                exit(1);
+            }
+        }
+    }
+}
+
 fn main() {
     // Initialize logging
     pretty_env_logger::init();
@@ -169,40 +185,15 @@ fn update_data(data: &mut PromData, longest_metric: &Gauge, debugfs: &Path, no_c
 
     // Loop on clients
     let dir = match read_dir(&debugfs) {
-        Ok(d) => d,
-        Err(e) => {
-            if e.kind() == IoErrorKind::NotFound && no_ceph_ok {
-                return;
-            } else {
-                error!("Error reading debug filesystem: {}", e);
-                exit(1);
-            }
-        }
-    };
+        Err(e) if e.kind() == IoErrorKind::NotFound && no_ceph_ok => return,
+        o => o,
+    }.or_exit("Error reading debug filesystem");
     for client in dir {
-        let mut client = match client {
-            Ok(c) => c.path(),
-            Err(e) => {
-                error!("Error reading debug filesystem: {}", e);
-                exit(1);
-            }
-        };
+        let mut client = client.or_exit("Error reading debug filesystem").path();
         client.push("osdc");
-        let osdc = match File::open(client) {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Error opening osdc on debug filesystem: {}", e);
-                exit(1);
-            }
-        };
+        let osdc = File::open(client).or_exit("Error opening osdc on debug filesystem");
         let osdc = BufReader::new(osdc);
-        let osdc = match parse_osdc(osdc) {
-            Ok(o) => o,
-            Err(e) => {
-                error!("Error parsing osdc on debug filesystem: {}", e);
-                exit(1);
-            }
-        };
+        let osdc = parse_osdc(osdc).or_exit("Error parsing osdc on debug filesystem");
 
         for request in &osdc.requests {
             match osd_requests.entry(request.tid) {

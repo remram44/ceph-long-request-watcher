@@ -102,6 +102,7 @@ Options:
     let data: Arc<Mutex<PromData>> = Arc::new(Mutex::new(PromData {
         updated: Instant::now(),
         osd_requests: HashMap::new(),
+        mds_requests: HashMap::new(),
     }));
 
     // Set up Prometheus
@@ -109,6 +110,11 @@ Options:
     let longest_metric = Gauge::with_opts(longest_opts).unwrap();
     prometheus::default_registry()
         .register(Box::new(longest_metric.clone()))
+        .unwrap();
+    let longest_mds_opts = Opts::new("longest_mds_request_seconds", "Duration of longest MDS request");
+    let longest_mds_metric = Gauge::with_opts(longest_mds_opts).unwrap();
+    prometheus::default_registry()
+        .register(Box::new(longest_mds_metric.clone()))
         .unwrap();
 
     // Start metrics server thread
@@ -137,12 +143,13 @@ Options:
                     let data: &Mutex<_> = &*prom_data;
                     let data = data.lock().unwrap();
 
+                    let mut buffer = Vec::new();
+
+                    writeln!(buffer, "OSD:").unwrap();
                     let mut requests: Vec<_> = data.osd_requests.values().collect();
                     requests.sort_by(|&(target1, since1), &(target2, since2)| {
                         since2.cmp(since1).then(target1.cmp(target2))
                     });
-
-                    let mut buffer = Vec::new();
                     for (target, since) in requests {
                         writeln!(
                             buffer, "osd.{:<5} {:>5.1} second",
@@ -150,6 +157,20 @@ Options:
                             data.updated.duration_since(*since).as_secs_f64(),
                         ).unwrap();
                     }
+
+                    writeln!(buffer, "MDS:").unwrap();
+                    let mut requests: Vec<_> = data.mds_requests.values().collect();
+                    requests.sort_by(|&(target1, since1), &(target2, since2)| {
+                        since2.cmp(since1).then(target1.cmp(target2))
+                    });
+                    for (target, since) in requests {
+                        writeln!(
+                            buffer, "mds{} {:>5.1} second",
+                            target,
+                            data.updated.duration_since(*since).as_secs_f64(),
+                        ).unwrap();
+                    }
+
                     buffer
                 }))
                 ;
@@ -161,9 +182,13 @@ Options:
     let data: &Mutex<_> = &*data;
 
     loop {
-        {
-            update_data(&mut data.lock().unwrap(), &longest_metric, &debugfs, no_ceph_ok);
-        }
+        update_data(
+            &mut data.lock().unwrap(),
+            &longest_metric,
+            &longest_mds_metric,
+            &debugfs,
+            no_ceph_ok,
+        );
 
         // Wait before next measurement
         std::thread::sleep(Duration::from_secs_f32(interval));
@@ -173,15 +198,27 @@ Options:
 struct PromData {
     updated: Instant,
     osd_requests: HashMap<u64, (u32, Instant)>,
+    mds_requests: HashMap<u64, (u32, Instant)>,
 }
 
-fn update_data(data: &mut PromData, longest_metric: &Gauge, debugfs: &Path, no_ceph_ok: bool) {
-    let mut seen_tids: HashSet<u64> = HashSet::new();
-    let &mut PromData { ref mut updated, ref mut osd_requests } = &mut *data;
+fn update_data(
+    data: &mut PromData,
+    longest_metric: &Gauge,
+    longest_mds_metric: &Gauge,
+    debugfs: &Path,
+    no_ceph_ok: bool,
+) {
+    let mut seen_osd_tids: HashSet<u64> = HashSet::new();
+    let mut seen_mds_tids: HashSet<u64> = HashSet::new();
+    let &mut PromData {
+        ref mut updated,
+        ref mut osd_requests,
+        ref mut mds_requests,
+    } = &mut *data;
 
     *updated = Instant::now();
-    seen_tids.clear();
-    let mut longest: f64 = 0.0;
+    let mut longest_osd: f64 = 0.0;
+    let mut longest_mds: f64 = 0.0;
 
     // Loop on clients
     let dir = match read_dir(&debugfs) {
@@ -189,40 +226,78 @@ fn update_data(data: &mut PromData, longest_metric: &Gauge, debugfs: &Path, no_c
         o => o,
     }.or_exit("Error reading debug filesystem");
     for client in dir {
-        let mut client = client.or_exit("Error reading debug filesystem").path();
-        client.push("osdc");
-        let osdc = File::open(client).or_exit("Error opening osdc on debug filesystem");
-        let osdc = BufReader::new(osdc);
-        let osdc = parse_osdc(osdc).or_exit("Error parsing osdc on debug filesystem");
+        let client = client.or_exit("Error reading debug filesystem").path();
 
-        for request in &osdc.requests {
-            match osd_requests.entry(request.tid) {
-                std::collections::hash_map::Entry::Occupied(value) => {
-                    let (_, first_seen) = *value.get();
-                    longest = longest.max(updated.duration_since(first_seen).as_secs_f64());
+        // Read OSD requests from osdc
+        {
+            let osdc = File::open(client.join("osdc")).or_exit("Error opening osdc on debug filesystem");
+            let osdc = BufReader::new(osdc);
+            let osdc = parse_osdc(osdc).or_exit("Error parsing osdc on debug filesystem");
+
+            for request in &osdc.requests {
+                match osd_requests.entry(request.tid) {
+                    std::collections::hash_map::Entry::Occupied(value) => {
+                        let (_, first_seen) = *value.get();
+                        longest_osd = longest_osd.max(updated.duration_since(first_seen).as_secs_f64());
+                    }
+                    std::collections::hash_map::Entry::Vacant(value) => {
+                        value.insert((request.target, *updated));
+                    }
                 }
-                std::collections::hash_map::Entry::Vacant(value) => {
-                    value.insert((request.target, *updated));
+                seen_osd_tids.insert(request.tid);
+            }
+        }
+
+        // Read MDS requests from mdsc
+        {
+            let mdsc = match File::open(client.join("mdsc")) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.kind() == IoErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }.or_exit("Error opening mdsc on debug filesystem");
+            if let Some(mdsc) = mdsc {
+                let mdsc = BufReader::new(mdsc);
+                let mdsc = parse_mdsc(mdsc).or_exit("Error parsing mdsc on debug filesystem");
+
+                for request in &mdsc.requests {
+                    match mds_requests.entry(request.tid) {
+                        std::collections::hash_map::Entry::Occupied(value) => {
+                            let (_, first_seen) = *value.get();
+                            longest_mds = longest_mds.max(updated.duration_since(first_seen).as_secs_f64());
+                        }
+                        std::collections::hash_map::Entry::Vacant(value) => {
+                            value.insert((request.target, *updated));
+                        }
+                    }
+                    seen_mds_tids.insert(request.tid);
                 }
             }
-            seen_tids.insert(request.tid);
         }
     }
 
     // Forget unseen requests
-    osd_requests.retain(|k, _| seen_tids.contains(k));
+    osd_requests.retain(|k, _| seen_osd_tids.contains(k));
+    mds_requests.retain(|k, _| seen_mds_tids.contains(k));
 
-    // Set metric
-    longest_metric.set(longest);
+    // Set metrics
+    longest_metric.set(longest_osd);
+    longest_mds_metric.set(longest_mds);
+}
+
+fn get_num_from_regex<F: std::str::FromStr>(m: Option<regex::Match>) -> Result<F, IoError> {
+    match m.unwrap().as_str().parse::<F>() {
+        Ok(i) => Ok(i),
+        Err(_) => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid field")),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Osdc {
-    requests: Vec<Request>,
+    requests: Vec<OsdRequest>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Request {
+struct OsdRequest {
     tid: u64,
     pool: u32,
     target: u32,
@@ -245,6 +320,7 @@ fn parse_osdc<R: BufRead>(mut file: R) -> Result<Osdc, IoError> {
             break;
         }
 
+        // https://github.com/torvalds/linux/blob/7d4050728c83aa63828494ad0f4d0eb4faf5f97a/net/ceph/debugfs.c#L183
         static REQUEST_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(
             "^(?P<tid>[0-9]+)\
             \tosd(?P<target>[0-9]+)\
@@ -261,23 +337,58 @@ fn parse_osdc<R: BufRead>(mut file: R) -> Result<Osdc, IoError> {
         ).unwrap());
         let cap = match REQUEST_REGEX.captures(&line) {
             Some(c) => c,
-            None => {
-                return Err(IoError::new(IoErrorKind::InvalidData, "Invalid request line"));
-            }
+            None => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid request line")),
         };
-        fn get_num<F: std::str::FromStr>(m: Option<regex::Match>) -> Result<F, IoError> {
-            match m.unwrap().as_str().parse::<F>() {
-                Ok(i) => Ok(i),
-                Err(_) => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid field")),
-            }
-        }
-        osdc.requests.push(Request {
-            tid: get_num(cap.name("tid"))?,
-            pool: get_num(cap.name("pool"))?,
-            target: get_num(cap.name("target"))?,
+        osdc.requests.push(OsdRequest {
+            tid: get_num_from_regex(cap.name("tid"))?,
+            pool: get_num_from_regex(cap.name("pool"))?,
+            target: get_num_from_regex(cap.name("target"))?,
         });
     }
     Ok(osdc)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Mdsc {
+    requests: Vec<MdsRequest>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MdsRequest {
+    tid: u64,
+    op: String,
+    target: u32,
+}
+
+fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
+    let mut mdsc = Mdsc {
+        requests: Vec::new(),
+    };
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if file.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        // https://github.com/torvalds/linux/blob/7d4050728c83aa63828494ad0f4d0eb4faf5f97a/fs/ceph/debugfs.c#L52
+        static REQUEST_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(
+            "^(?P<tid>[0-9]+)\
+            \tmds(?P<target>[0-9]+)\
+            \t(?P<op>[^ ]+)\
+            \t"
+        ).unwrap());
+        let cap = match REQUEST_REGEX.captures(&line) {
+            Some(c) => c,
+            None => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid request line")),
+        };
+        mdsc.requests.push(MdsRequest {
+            tid: get_num_from_regex(cap.name("tid"))?,
+            op: cap.name("op").unwrap().as_str().to_owned(),
+            target: get_num_from_regex(cap.name("target"))?,
+        });
+    }
+    Ok(mdsc)
 }
 
 #[test]
@@ -288,10 +399,26 @@ fn test_parse_osdc() {
     let osdc = parse_osdc(file).unwrap();
     assert_eq!(osdc, Osdc {
         requests: vec![
-            Request {
+            OsdRequest {
                 tid: 8141767,
                 pool: 40,
                 target: 807,
+            },
+        ],
+    });
+}
+
+#[test]
+fn test_parse_mdsc() {
+    use std::io::Cursor;
+
+    let file = Cursor::new("3923\tmds0\treaddir\t#10004c8cd1d\n");
+    let mdsc = parse_mdsc(file).unwrap();
+    assert_eq!(mdsc, Mdsc {
+        requests: vec![
+            MdsRequest {
+                tid: 3923,
+                target: 0,
             },
         ],
     });

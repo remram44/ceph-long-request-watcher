@@ -1,3 +1,4 @@
+use futures;
 use once_cell::sync::Lazy;
 use prometheus::{Gauge, Opts};
 use regex::Regex;
@@ -117,6 +118,8 @@ Options:
         .register(Box::new(longest_mds_metric.clone()))
         .unwrap();
 
+    let listener = std::net::TcpListener::bind(metrics_addr).or_exit("Can't create listener for metrics");
+
     // Start metrics server thread
     let prom_data: Arc<_> = data.clone();
     {
@@ -172,9 +175,14 @@ Options:
                     }
 
                     buffer
-                }))
-                ;
-                warp::serve(routes).run(metrics_addr).await;
+                }));
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let incoming = futures::stream::unfold(listener, |listener| async move {
+                    let client = listener.accept().await.map(|(c, _)| c);
+                    Some((client, listener))
+                });
+                warp::serve(routes).run_incoming(incoming).await;
             });
         });
     }

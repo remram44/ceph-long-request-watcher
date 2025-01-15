@@ -345,7 +345,7 @@ fn parse_osdc<R: BufRead>(mut file: R) -> Result<Osdc, IoError> {
         ).unwrap());
         let cap = match REQUEST_REGEX.captures(&line) {
             Some(c) => c,
-            None => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid request line")),
+            None => return Err(IoError::new(IoErrorKind::InvalidData, format!("Invalid request line: {}", line))),
         };
         osdc.requests.push(OsdRequest {
             tid: get_num_from_regex(cap.name("tid"))?,
@@ -388,7 +388,7 @@ fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
         ).unwrap());
         let cap = match REQUEST_REGEX.captures(&line) {
             Some(c) => c,
-            None => return Err(IoError::new(IoErrorKind::InvalidData, "Invalid request line")),
+            None => return Err(IoError::new(IoErrorKind::InvalidData, format!("Invalid request line: {}", line))),
         };
         mdsc.requests.push(MdsRequest {
             tid: get_num_from_regex(cap.name("tid"))?,

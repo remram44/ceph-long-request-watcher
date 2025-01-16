@@ -167,11 +167,17 @@ Options:
                         since2.cmp(since1).then(target1.cmp(target2))
                     });
                     for (target, since) in requests {
-                        writeln!(
-                            buffer, "mds{} {:>5.1} second",
-                            target,
-                            data.updated.duration_since(*since).as_secs_f64(),
-                        ).unwrap();
+                        match target {
+                            Some(target) => writeln!(
+                                buffer, "mds{} {:.1} second",
+                                target,
+                                data.updated.duration_since(*since).as_secs_f64(),
+                            ).unwrap(),
+                            None => writeln!(
+                                buffer, "(none) {:.1} second",
+                                data.updated.duration_since(*since).as_secs_f64(),
+                            ).unwrap(),
+                        }
                     }
 
                     buffer
@@ -206,7 +212,7 @@ Options:
 struct PromData {
     updated: Instant,
     osd_requests: HashMap<u64, (u32, Instant)>,
-    mds_requests: HashMap<u64, (u32, Instant)>,
+    mds_requests: HashMap<u64, (Option<u32>, Instant)>,
 }
 
 fn update_data(
@@ -365,7 +371,7 @@ struct Mdsc {
 struct MdsRequest {
     tid: u64,
     op: String,
-    target: u32,
+    target: Option<u32>,
 }
 
 fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
@@ -382,7 +388,7 @@ fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
         // https://github.com/torvalds/linux/blob/7d4050728c83aa63828494ad0f4d0eb4faf5f97a/fs/ceph/debugfs.c#L52
         static REQUEST_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(
             "^(?P<tid>[0-9]+)\
-            \tmds(?P<target>[0-9]+)\
+            \t(\\(no request\\)|mds(?P<target>[0-9]+))\
             \t(?P<op>[^ ]+)\
             \t"
         ).unwrap());
@@ -393,7 +399,10 @@ fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
         mdsc.requests.push(MdsRequest {
             tid: get_num_from_regex(cap.name("tid"))?,
             op: cap.name("op").unwrap().as_str().to_owned(),
-            target: get_num_from_regex(cap.name("target"))?,
+            target: match cap.name("target") {
+                Some(c) => Some(get_num_from_regex(Some(c))?),
+                None => None,
+            },
         });
     }
     Ok(mdsc)
@@ -420,14 +429,22 @@ fn test_parse_osdc() {
 fn test_parse_mdsc() {
     use std::io::Cursor;
 
-    let file = Cursor::new("3923\tmds0\treaddir\t#10004c8cd1d\n");
+    let file = Cursor::new(concat!(
+        "3923\tmds0\treaddir\t#10004c8cd1d\n",
+        "8317\t(no request)\tgetattr\t#1\n",
+    ));
     let mdsc = parse_mdsc(file).unwrap();
     assert_eq!(mdsc, Mdsc {
         requests: vec![
             MdsRequest {
                 tid: 3923,
                 op: "readdir".to_owned(),
-                target: 0,
+                target: Some(0),
+            },
+            MdsRequest {
+                tid: 8317,
+                op: "getattr".to_owned(),
+                target: None,
             },
         ],
     });

@@ -426,6 +426,7 @@ fn test_parse_mdsc() {
         requests: vec![
             MdsRequest {
                 tid: 3923,
+                op: "readdir".to_owned(),
                 target: 0,
             },
         ],

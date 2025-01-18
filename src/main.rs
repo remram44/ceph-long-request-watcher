@@ -381,6 +381,18 @@ fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
     let mut line = String::new();
     loop {
         line.clear();
+        match file.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                let mut sample = [0u8; 512];
+                match file.read(&mut sample) {
+                    Ok(l) => error!("mdsc: {}: {:?}", e, &sample[0..l]),
+                    Err(_) => error!("mdsc: {}", e),
+                }
+                return Err(e);
+            }
+        }
         if file.read_line(&mut line)? == 0 {
             break;
         }

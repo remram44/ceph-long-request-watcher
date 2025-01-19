@@ -393,9 +393,6 @@ fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
                 return Err(e);
             }
         }
-        if file.read_line(&mut line)? == 0 {
-            break;
-        }
 
         // https://github.com/torvalds/linux/blob/7d4050728c83aa63828494ad0f4d0eb4faf5f97a/fs/ceph/debugfs.c#L52
         static REQUEST_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(

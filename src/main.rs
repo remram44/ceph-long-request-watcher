@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::env::args_os;
 use std::ffi::OsString;
 use std::fs::{File, read_dir};
-use std::io::{BufReader, BufRead, Error as IoError, ErrorKind as IoErrorKind, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufRead, Error as IoError, ErrorKind as IoErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::{Arc, Mutex};
@@ -374,26 +374,24 @@ struct MdsRequest {
     target: Option<u32>,
 }
 
-fn parse_mdsc<R: BufRead + Seek>(mut file: R) -> Result<Mdsc, IoError> {
+fn parse_mdsc<R: BufRead>(mut file: R) -> Result<Mdsc, IoError> {
     let mut mdsc = Mdsc {
         requests: Vec::new(),
     };
     let mut line = String::new();
     loop {
         line.clear();
-        match file.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                let mut sample = [0u8; 512];
-                let _ = file.seek(SeekFrom::Start(0));
-                match file.read(&mut sample) {
-                    Ok(l) => error!("mdsc: {}: {:?}", e, &sample[0..l]),
-                    Err(_) => error!("mdsc: {}", e),
-                }
-                return Err(e);
-            }
+        let mut buf = Vec::new();
+        if file.read_until(b'\n', &mut buf)? == 0 {
+            break;
         }
+        if let Err(_) = std::str::from_utf8(&buf) {
+            error!("mdsc: Invalid UTF-8: {:?}", &buf);
+        }
+        line.push_str(std::str::from_utf8(&buf).map_err(|_| IoError::new(
+            IoErrorKind::InvalidData,
+            "Invalid UTF-8",
+        ))?);
 
         // https://github.com/torvalds/linux/blob/7d4050728c83aa63828494ad0f4d0eb4faf5f97a/fs/ceph/debugfs.c#L52
         static REQUEST_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(
